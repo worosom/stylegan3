@@ -293,6 +293,7 @@ def open_dest(dest: str) -> Tuple[str, Callable[[str, Union[bytes, str]], None],
         zf = zipfile.ZipFile(file=dest, mode='w', compression=zipfile.ZIP_STORED)
         def zip_write_bytes(fname: str, data: Union[bytes, str]):
             zf.writestr(fname, data)
+            return fname
         return '', zip_write_bytes, zf.close
     else:
         # If the output folder already exists, check that is is
@@ -312,6 +313,7 @@ def open_dest(dest: str) -> Tuple[str, Callable[[str, Union[bytes, str]], None],
                 if isinstance(data, str):
                     data = data.encode('utf8')
                 fout.write(data)
+                return fname
         return dest, folder_write_bytes, lambda: None
 
 #----------------------------------------------------------------------------
