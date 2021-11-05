@@ -1,24 +1,3 @@
-# Render Args
-# pkl             = None,
-# w0_seeds        = [[0, 1]],
-# stylemix_idx    = [],
-# stylemix_seed   = 0,
-# trunc_psi       = 1,
-# trunc_cutoff    = 0,
-# random_seed     = 0,
-# noise_mode      = 'const',
-# force_fp32      = False,
-# layer_name      = None,
-# sel_channels    = 3,
-# base_channel    = 0,
-# img_scale_db    = 0,
-# img_normalize   = False,
-# fft_show        = False,
-# fft_all         = True,
-# fft_range_db    = 50,
-# fft_beta        = 8,
-# input_transform = None,
-# untransform     = False,
 # Copyright (c) 2021, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
 #
 # NVIDIA CORPORATION and its licensors retain all intellectual property
@@ -38,6 +17,7 @@ import matplotlib.cm
 import dnnlib
 from torch_utils.ops import upfirdn2d
 import legacy # pylint: disable=import-error
+import multiprocessing
 
 #----------------------------------------------------------------------------
 
@@ -242,10 +222,63 @@ class _Renderer:
         x = torch.nn.functional.embedding(x, cmap)
         return x
 
+    def _apply_input_transform(self, G, input_transform):
+        m = np.eye(3)
+        try:
+            if input_transform is not None:
+                m = np.linalg.inv(np.asarray(input_transform, dtype=np.float64))
+        except np.linalg.LinAlgError:
+            res.error = CapturedException()
+        G.synthesis.input.transform.copy_(torch.from_numpy(m))
+
+    def map_latents(self, G, all_zs, all_cs, trunc_psi=1, trunc_cutoff=0):
+        w_avg = 0
+        all_zs = self.to_device(torch.from_numpy(np.asarray(all_zs)))
+        all_cs = self.to_device(torch.from_numpy(np.asarray(all_cs)))
+        all_ws = G.mapping(z=all_zs, c=all_cs, truncation_psi=trunc_psi, truncation_cutoff=trunc_cutoff) - w_avg
+        return w_avg, all_ws.double()
+
+    def get_latents(self, G, w0_seeds, stylemix_seed=None):
+        all_seeds = [seed for seed, _weight in w0_seeds]
+        if stylemix_seed is not None:
+            all_seeds += [stylemix_seed]
+        all_seeds = list(set(all_seeds))
+        all_zs = np.zeros([len(all_seeds), G.z_dim], dtype=np.float32)
+        all_cs = np.zeros([len(all_seeds), G.c_dim], dtype=np.float32)
+        for idx, seed in enumerate(all_seeds):
+            rnd = np.random.RandomState(seed)
+            all_zs[idx] = rnd.randn(G.z_dim)
+            if G.c_dim > 0:
+                all_cs[idx, rnd.randint(G.c_dim)] = 1
+        return all_seeds, all_zs, all_cs
+
+    def interpolate_seeds(self,
+            G,
+            w0_seeds,
+            stylemix_seed=0,
+            stylemix_idx=0,
+            trunc_psi=1,
+            trunc_cutoff=0):
+        # Generate random latents.
+        all_seeds, all_zs, all_cs = self.get_latents(G, w0_seeds, stylemix_seed)
+        # Run mapping network.
+        w_avg, all_ws = self.map_latents(G, all_zs, all_cs, trunc_psi=trunc_psi, trunc_cutoff=trunc_cutoff)
+        # res.all_ws = all_ws.tolist()
+        all_ws = dict(zip(all_seeds, all_ws))
+
+        # Calculate final W.
+        w = torch.stack([all_ws[seed] * weight for seed, weight in w0_seeds]).sum(dim=0, keepdim=True)
+        stylemix_idx = [idx for idx in stylemix_idx if 0 <= idx < G.num_ws]
+        if len(stylemix_idx) > 0:
+            w[:, stylemix_idx] = all_ws[stylemix_seed][np.newaxis, stylemix_idx]
+        w += w_avg
+
+        return w
+
     def _render_impl(self, res,
         pkl             = None,
         w0_seeds        = [[0, 1]],
-        latents         = [],
+        w               = None,
         stylemix_idx    = [],
         stylemix_seed   = 0,
         trunc_psi       = 1,
@@ -264,6 +297,7 @@ class _Renderer:
         fft_beta        = 8,
         input_transform = None,
         untransform     = False,
+        **kwargs
     ):
         # Dig up network details.
         G = self.get_network(pkl, 'G_ema')
@@ -274,47 +308,13 @@ class _Renderer:
 
         # Set input transform.
         if res.has_input_transform:
-            m = np.eye(3)
-            try:
-                if input_transform is not None:
-                    m = np.linalg.inv(np.asarray(input_transform))
-            except np.linalg.LinAlgError:
-                res.error = CapturedException()
-            G.synthesis.input.transform.copy_(torch.from_numpy(m))
+            self._apply_input_transform(G, input_transform)
 
-        if len(latents):
-            all_zs, all_cs = zip(*latents)
+        if w is not None:
+            w = self.to_device(torch.from_numpy(np.asarray(w)))
         else:
-            # Generate random latents.
-            all_seeds = [seed for seed, _weight in w0_seeds] + [stylemix_seed]
-            all_seeds = list(set(all_seeds))
-            all_zs = np.zeros([len(all_seeds), G.z_dim], dtype=np.float32)
-            all_cs = np.zeros([len(all_seeds), G.c_dim], dtype=np.float32)
-            for idx, seed in enumerate(all_seeds):
-                rnd = np.random.RandomState(seed)
-                all_zs[idx] = rnd.randn(G.z_dim)
-                if G.c_dim > 0:
-                    all_cs[idx, rnd.randint(G.c_dim)] = 1
-
-        print(w0_seeds)
-        res.w0_seeds = w0_seeds
-        res.all_cs = all_cs.tolist()
-        res.all_zs = all_zs.tolist()
-
-        # Run mapping network.
-        w_avg = G.mapping.w_avg
-        all_zs = self.to_device(torch.from_numpy(all_zs))
-        all_cs = self.to_device(torch.from_numpy(all_cs))
-        all_ws = G.mapping(z=all_zs, c=all_cs, truncation_psi=trunc_psi, truncation_cutoff=trunc_cutoff) - w_avg
-        res.all_ws = all_ws.tolist()
-        all_ws = dict(zip(all_seeds, all_ws))
-
-        # Calculate final W.
-        w = torch.stack([all_ws[seed] * weight for seed, weight in w0_seeds]).sum(dim=0, keepdim=True)
-        stylemix_idx = [idx for idx in stylemix_idx if 0 <= idx < G.num_ws]
-        if len(stylemix_idx) > 0:
-            w[:, stylemix_idx] = all_ws[stylemix_seed][np.newaxis, stylemix_idx]
-        w += w_avg
+            w = self.interpolate_seeds(G, w0_seeds, stylemix_seed, stylemix_idx, trunc_psi, trunc_cutoff)
+            res.w0_seeds = w0_seeds
 
         # Run synthesis network.
         synthesis_kwargs = dnnlib.EasyDict(noise_mode=noise_mode, force_fp32=force_fp32)
@@ -493,22 +493,3 @@ class AsyncRenderer:
                 cur_args = args
                 cur_stamp = stamp
 
-
-class Renderer(AsyncRenderer):
-    def __init__(self):
-        super().__init__()
-    
-    def set_network(self, pkl):
-        if not self._cur_args \
-            or 'pkl' not in self._cur_args \
-            or pkl is not self._cur_args['pkl']:
-            self.set_args(pkl=pkl)
-
-    def set_latents(self, latents):
-        self.set_args(latents=latents)
-
-    def set_seed(self, seeds):
-        self.set_args(w0_seeds=seeds)
-
-    def get(self):
-        return self.get_result()

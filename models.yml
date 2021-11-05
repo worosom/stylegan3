@@ -1,4 +1,4 @@
 nature:
-  latents: nle_cache\nature\samples_latents.json
-  network: .\network-snapshot-002320.pkl
-  samples: nle_cache\nature\samples
+  latents: nle_cache/nature/samples_latents.json
+  network: results/nature-network-snapshot-002800.pkl
+  samples: nle_cache/nature/samples
