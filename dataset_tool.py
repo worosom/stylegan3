@@ -66,8 +66,35 @@ def is_image_ext(fname: Union[str, Path]) -> bool:
 
 #----------------------------------------------------------------------------
 
+from multiprocessing import Pool
+
+def read_image(fname):
+    return np.array(PIL.Image.open(fname))
+
+def open_image_list(file_list, *, labels: Optional[dict], max_images: Optional[int]):
+    max_idx = maybe_min(len(file_list), max_images)
+    batch_size = 1024
+    batches = (file_list[idx:idx+batch_size] for idx in range(0, len(file_list), batch_size))
+    def iterate_images():
+        with Pool(40) as p:
+            for batch in batches:
+                images = p.map(read_image, batch)
+                for idx, (fname, img) in enumerate(zip(batch, images)):
+                    arch_fname = fname.replace('\\', '/')
+                    yield dict(img=img, label=labels.get(arch_fname))
+                    if idx >= max_idx-1:
+                        break
+
+    return max_idx, iterate_images()
+
+#----------------------------------------------------------------------------
+
 def open_image_folder(source_dir, *, max_images: Optional[int]):
-    input_images = [str(f) for f in sorted(Path(source_dir).rglob('*')) if is_image_ext(f) and os.path.isfile(f)]
+    input_images = [
+            str(f)
+            for f in sorted(tqdm(Path(source_dir).rglob('*')))
+            if is_image_ext(f) and os.path.isfile(f)
+            ]
 
     # Load labels.
     labels = {}
@@ -80,17 +107,7 @@ def open_image_folder(source_dir, *, max_images: Optional[int]):
             else:
                 labels = {}
 
-    max_idx = maybe_min(len(input_images), max_images)
-
-    def iterate_images():
-        for idx, fname in enumerate(input_images):
-            arch_fname = os.path.relpath(fname, source_dir)
-            arch_fname = arch_fname.replace('\\', '/')
-            img = np.array(PIL.Image.open(fname))
-            yield dict(img=img, label=labels.get(arch_fname))
-            if idx >= max_idx-1:
-                break
-    return max_idx, iterate_images()
+    return open_image_list(input_images, labels, max_images=max_images)
 
 #----------------------------------------------------------------------------
 
@@ -214,10 +231,10 @@ def open_mnist(images_gz: str, *, max_images: Optional[int]):
 #----------------------------------------------------------------------------
 
 def make_transform(
-    transform: Optional[str],
-    output_width: Optional[int],
-    output_height: Optional[int]
-) -> Callable[[np.ndarray], Optional[np.ndarray]]:
+        transform: Optional[str],
+        output_width: Optional[int],
+        output_height: Optional[int]
+        ) -> Callable[[np.ndarray], Optional[np.ndarray]]:
     def scale(width, height, img):
         w = img.shape[1]
         h = img.shape[0]
@@ -271,7 +288,18 @@ def open_dataset(source, *, max_images: Optional[int]):
         else:
             return open_image_folder(source, max_images=max_images)
     elif os.path.isfile(source):
-        if os.path.basename(source) == 'cifar-10-python.tar.gz':
+        if source.endswith('.txt'):
+            dirname = os.path.dirname(source)
+            file_list = [os.path.join(dirname, line.rstrip()) for line in open(source)]
+            meta_fname = source + '.json'
+            labels = {}
+            if os.path.isfile(meta_fname):
+                with open(meta_fname, 'r') as file:
+                    labels = json.load(file)['labels']
+                    if labels is not None:
+                        labels = { x[0]: x[1] for x in labels }
+            return open_image_list(file_list, labels=labels, max_images=max_images)
+        elif os.path.basename(source) == 'cifar-10-python.tar.gz':
             return open_cifar10(source, max_images=max_images)
         elif os.path.basename(source) == 'train-images-idx3-ubyte.gz':
             return open_mnist(source, max_images=max_images)
@@ -324,13 +352,13 @@ def open_dest(dest: str) -> Tuple[str, Callable[[str, Union[bytes, str]], None],
 @click.option('--transform', help='Input crop/resize mode', type=click.Choice(['center-crop', 'center-crop-wide']))
 @click.option('--resolution', help='Output resolution (e.g., \'512x512\')', metavar='WxH', type=parse_tuple)
 def convert_dataset(
-    ctx: click.Context,
-    source: str,
-    dest: str,
-    max_images: Optional[int],
-    transform: Optional[str],
-    resolution: Optional[Tuple[int, int]]
-):
+        ctx: click.Context,
+        source: str,
+        dest: str,
+        max_images: Optional[int],
+        transform: Optional[str],
+        resolution: Optional[Tuple[int, int]]
+        ):
     """Convert an image dataset into a dataset archive usable with StyleGAN2 ADA PyTorch.
 
     The input dataset format is guessed from the --source argument:
@@ -387,7 +415,7 @@ def convert_dataset(
 
     \b
     python dataset_tool.py --source LSUN/raw/cat_lmdb --dest /tmp/lsun_cat \\
-        --transform=center-crop-wide --resolution=512x384
+            --transform=center-crop-wide --resolution=512x384
     """
 
     PIL.Image.init() # type: ignore
@@ -409,7 +437,8 @@ def convert_dataset(
         archive_fname = f'{idx_str[:5]}/img{idx_str}.png'
 
         # Apply crop and resize.
-        img = transform_image(image['img'])
+        # img = transform_image(image['img'])
+        img = image['img']
 
         # Transform may drop images.
         if img is None:
@@ -419,10 +448,10 @@ def convert_dataset(
         # the whole dataset.
         channels = img.shape[2] if img.ndim == 3 else 1
         cur_image_attrs = {
-            'width': img.shape[1],
-            'height': img.shape[0],
-            'channels': channels
-        }
+                'width': img.shape[1],
+                'height': img.shape[0],
+                'channels': channels
+                }
         if dataset_attrs is None:
             dataset_attrs = cur_image_attrs
             width = dataset_attrs['width']
@@ -445,8 +474,8 @@ def convert_dataset(
         labels.append([archive_fname, image['label']] if image['label'] is not None else None)
 
     metadata = {
-        'labels': labels if all(x is not None for x in labels) else None
-    }
+            'labels': labels if all(x is not None for x in labels) else None
+            }
     save_bytes(os.path.join(archive_root_dir, 'dataset.json'), json.dumps(metadata))
     close_dest()
 

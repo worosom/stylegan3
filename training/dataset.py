@@ -15,6 +15,7 @@ import PIL.Image
 import json
 import torch
 import dnnlib
+from tqdm import tqdm
 
 try:
     import pyspng
@@ -155,19 +156,26 @@ class Dataset(torch.utils.data.Dataset):
 
 class ImageFolderDataset(Dataset):
     def __init__(self,
-        path,                   # Path to directory or zip.
-        resolution      = None, # Ensure specific resolution, None = highest available.
-        **super_kwargs,         # Additional arguments for the Dataset base class.
-    ):
+            path,                   # Path to directory or zip.
+            resolution = None,      # Ensure specific resolution, None = highest available.
+            **super_kwargs,         # Additional arguments for the Dataset base class.
+        ):
         self._path = path
         self._zipfile = None
 
         if os.path.isdir(self._path):
+            name = os.path.splitext(os.path.basename(self._path))[0]
             self._type = 'dir'
-            self._all_fnames = {os.path.relpath(os.path.join(root, fname), start=self._path) for root, _dirs, files in os.walk(self._path) for fname in files}
+            self._all_fnames = {os.path.relpath(os.path.join(root, fname), start=self._path) for root, _dirs, files in os.walk(self._path) for fname in tqdm(files)}
         elif self._file_ext(self._path) == '.zip':
+            name = os.path.splitext(os.path.basename(self._path))[0]
             self._type = 'zip'
             self._all_fnames = set(self._get_zipfile().namelist())
+        elif self._file_ext(self._path) == '.txt':
+            basename, tail = os.path.split(self._path)
+            name = tail.split('.')[0]
+            self._type = 'txt'
+            self._all_fnames = {os.path.join(basename, fname.rstrip()) for fname in open(self._path)}
         else:
             raise IOError('Path must point to a directory or zip')
 
@@ -176,7 +184,6 @@ class ImageFolderDataset(Dataset):
         if len(self._image_fnames) == 0:
             raise IOError('No image files found in the specified path')
 
-        name = os.path.splitext(os.path.basename(self._path))[0]
         raw_shape = [len(self._image_fnames)] + list(self._load_raw_image(0).shape)
         if resolution is not None and (raw_shape[2] != resolution or raw_shape[3] != resolution):
             raise IOError('Image files do not match the specified resolution')
@@ -188,11 +195,13 @@ class ImageFolderDataset(Dataset):
 
     def _get_zipfile(self):
         assert self._type == 'zip'
-        if self._zipfile is None:
-            self._zipfile = zipfile.ZipFile(self._path)
+        if self._zipfile is none:
+            self._zipfile = zipfile.zipfile(self._path)
         return self._zipfile
 
     def _open_file(self, fname):
+        if self._type == 'txt':
+            return open(fname, 'rb')
         if self._type == 'dir':
             return open(os.path.join(self._path, fname), 'rb')
         if self._type == 'zip':
