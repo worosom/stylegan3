@@ -69,7 +69,9 @@ def launch_training(c, desc, outdir, dry_run):
     print(f'Output directory:    {c.run_dir}')
     print(f'Number of GPUs:      {c.num_gpus}')
     print(f'Batch size:          {c.batch_size} images')
+    print(f'Noise mode:          {c.loss_kwargs.noise_mode}')
     print(f'Training duration:   {c.total_kimg} kimg')
+    print(f'Resume kimg:         {c.resume_kimg} kimg')
     print(f'Dataset path:        {c.training_set_kwargs.path}')
     print(f'Dataset size:        {c.training_set_kwargs.max_size} images')
     print(f'Dataset resolution:  {c.training_set_kwargs.resolution}')
@@ -99,9 +101,9 @@ def launch_training(c, desc, outdir, dry_run):
 
 #----------------------------------------------------------------------------
 
-def init_dataset_kwargs(data):
+def init_dataset_kwargs(data, resolution):
     try:
-        dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data, use_labels=True, max_size=None, xflip=False)
+        dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data, resolution=resolution, use_labels=True, max_size=None, xflip=False)
         dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs) # Subclass of training.dataset.Dataset.
         dataset_kwargs.resolution = dataset_obj.resolution # Be explicit about resolution.
         dataset_kwargs.use_labels = dataset_obj.has_labels # Be explicit about labels.
@@ -130,6 +132,8 @@ def parse_comma_separated_list(s):
 @click.option('--gpus',         help='Number of GPUs to use', metavar='INT',                    type=click.IntRange(min=1), required=True)
 @click.option('--batch',        help='Total batch size', metavar='INT',                         type=click.IntRange(min=1), required=True)
 @click.option('--gamma',        help='R1 regularization weight', metavar='FLOAT',               type=click.FloatRange(min=0), required=True)
+@click.option('--noise_mode',   help='Noise mode',                                              type=click.Choice(['random', 'const', 'none']), default='const')
+@click.option('--resolution',   help='GAN resolution', metavar='INT',                           type=click.IntRange(min=4), default=1024)
 
 # Optional features.
 @click.option('--cond',         help='Train conditional model', metavar='BOOL',                 type=bool, default=False, show_default=True)
@@ -153,35 +157,19 @@ def parse_comma_separated_list(s):
 @click.option('--desc',         help='String to include in result dir name', metavar='STR',     type=str)
 @click.option('--metrics',      help='Quality metrics', metavar='[NAME|A,B,C|none]',            type=parse_comma_separated_list, default='fid50k_full', show_default=True)
 @click.option('--kimg',         help='Total training duration', metavar='KIMG',                 type=click.IntRange(min=1), default=25000, show_default=True)
+@click.option('--resume_kimg',  help='First kimg to report when resuming', metavar='KIMG',      type=click.IntRange(min=0), default=0, show_default=True)
 @click.option('--tick',         help='How often to print progress', metavar='KIMG',             type=click.IntRange(min=1), default=4, show_default=True)
 @click.option('--snap',         help='How often to save snapshots', metavar='TICKS',            type=click.IntRange(min=1), default=50, show_default=True)
 @click.option('--seed',         help='Random seed', metavar='INT',                              type=click.IntRange(min=0), default=0, show_default=True)
 @click.option('--fp32',         help='Disable mixed-precision', metavar='BOOL',                 type=bool, default=False, show_default=True)
 @click.option('--nobench',      help='Disable cuDNN benchmarking', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--workers',      help='DataLoader worker processes', metavar='INT',              type=click.IntRange(min=1), default=3, show_default=True)
+@click.option('--prefetch',     help='DataLoader prefetch factor', metavar='INT',               type=click.IntRange(min=1), default=32, show_default=True)
 @click.option('-n','--dry-run', help='Print training options and exit',                         is_flag=True)
 
 def main(**kwargs):
     """Train a GAN using the techniques described in the paper
     "Alias-Free Generative Adversarial Networks".
-
-    Examples:
-
-    \b
-    # Train StyleGAN3-T for AFHQv2 using 8 GPUs.
-    python train.py --outdir=~/training-runs --cfg=stylegan3-t --data=~/datasets/afhqv2-512x512.zip \\
-        --gpus=8 --batch=32 --gamma=8.2 --mirror=1
-
-    \b
-    # Fine-tune StyleGAN3-R for MetFaces-U using 1 GPU, starting from the pre-trained FFHQ-U pickle.
-    python train.py --outdir=~/training-runs --cfg=stylegan3-r --data=~/datasets/metfacesu-1024x1024.zip \\
-        --gpus=8 --batch=32 --gamma=6.6 --mirror=1 --kimg=5000 --snap=5 \\
-        --resume=https://api.ngc.nvidia.com/v2/models/nvidia/research/stylegan3/versions/1/files/stylegan3-r-ffhqu-1024x1024.pkl
-
-    \b
-    # Train StyleGAN2 for FFHQ at 1024x1024 resolution using 8 GPUs.
-    python train.py --outdir=~/training-runs --cfg=stylegan2 --data=~/datasets/ffhq-1024x1024.zip \\
-        --gpus=8 --batch=32 --gamma=10 --mirror=1 --aug=noaug
     """
 
     # Initialize config.
@@ -191,11 +179,11 @@ def main(**kwargs):
     c.D_kwargs = dnnlib.EasyDict(class_name='training.networks_stylegan2.Discriminator', block_kwargs=dnnlib.EasyDict(), mapping_kwargs=dnnlib.EasyDict(), epilogue_kwargs=dnnlib.EasyDict())
     c.G_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
     c.D_opt_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', betas=[0,0.99], eps=1e-8)
-    c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2Loss')
-    c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, prefetch_factor=2)
+    c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2Loss', noise_mode=opts.noise_mode)
+    c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, prefetch_factor=opts.prefetch)
 
     # Training set.
-    c.training_set_kwargs, dataset_name = init_dataset_kwargs(data=opts.data)
+    c.training_set_kwargs, dataset_name = init_dataset_kwargs(data=opts.data, resolution=opts.resolution)
     if opts.cond and not c.training_set_kwargs.use_labels:
         raise click.ClickException('--cond=True requires labels specified in dataset.json')
     c.training_set_kwargs.use_labels = opts.cond
@@ -215,6 +203,7 @@ def main(**kwargs):
     c.D_opt_kwargs.lr = opts.dlr
     c.metrics = opts.metrics
     c.total_kimg = opts.kimg
+    c.resume_kimg = opts.resume_kimg
     c.kimg_per_tick = opts.tick
     c.image_snapshot_ticks = c.network_snapshot_ticks = opts.snap
     c.random_seed = c.training_set_kwargs.random_seed = opts.seed
@@ -273,7 +262,7 @@ def main(**kwargs):
         c.cudnn_benchmark = False
 
     # Description string.
-    desc = f'{opts.cfg:s}-{dataset_name:s}-gpus{c.num_gpus:d}-batch{c.batch_size:d}-gamma{c.loss_kwargs.r1_gamma:g}'
+    desc = f'{opts.cfg:s}-{dataset_name:s}-gpus{c.num_gpus:d}-batch{c.batch_size:d}-gamma{c.loss_kwargs.r1_gamma:g}-{opts.resolution}'
     if opts.desc is not None:
         desc += f'-{opts.desc}'
 

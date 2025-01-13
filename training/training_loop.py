@@ -30,15 +30,14 @@ from metrics import metric_main
 
 def setup_snapshot_image_grid(training_set, random_seed=0):
     rnd = np.random.RandomState(random_seed)
-    gw = np.clip(7680 // training_set.image_shape[2], 7, 32)
-    gh = np.clip(4320 // training_set.image_shape[1], 4, 32)
+    resolution = training_set.resolution
+    gw = np.clip(7680 // resolution, 6, 16)
+    gh = np.clip(4320 // resolution, 3, 16)
 
     # No labels => show random subset of training samples.
     if not training_set.has_labels:
-        all_indices = list(range(len(training_set)))
-        rnd.shuffle(all_indices)
-        grid_indices = [all_indices[i % len(all_indices)] for i in range(gw * gh)]
-
+        all_indices = np.arange(len(training_set), dtype=np.uint32)
+        grid_indices = rnd.choice(all_indices, size=gw*gh, replace=False)
     else:
         # Group training samples by label.
         label_groups = dict() # label => [idx, ...]
@@ -62,7 +61,12 @@ def setup_snapshot_image_grid(training_set, random_seed=0):
             label_groups[label] = [indices[(i + gw) % len(indices)] for i in range(len(indices))]
 
     # Load data.
-    images, labels = zip(*[training_set[i] for i in grid_indices])
+    def process(img, labels):
+        img = torch.tensor(img[None, ...]).to(torch.float32)
+        # img = torch.nn.functional.interpolate(img, (resolution,) * 2, mode='bicubic', align_corners=True)
+        return img.to(torch.uint8).numpy().squeeze(), labels
+    images, labels = zip(*[process(*training_set[i]) for i in grid_indices])
+
     return (gw, gh), np.stack(images), np.stack(labels)
 
 #----------------------------------------------------------------------------
@@ -161,6 +165,16 @@ def training_loop(
         for name, module in [('G', G), ('D', D), ('G_ema', G_ema)]:
             misc.copy_params_and_buffers(resume_data[name], module, require_all=False)
 
+    # for n, p in G.synthesis.named_parameters():
+    #     if int(n.split('.')[0][1:]) < 2048:
+    #         p.requires_grad = False
+    # for n, p in G_ema.synthesis.named_parameters():
+    #     if int(n.split('.')[0][1:]) < 2048:
+    #         p.requires_grad = False
+    # for n, p in D.named_parameters():
+    #     if int(n.split('.')[0][1:]) < 2048:
+    #         p.requires_grad = False
+
     # Print network summary tables.
     if rank == 0:
         z = torch.empty([batch_gpu, G.z_dim], device=device)
@@ -249,6 +263,7 @@ def training_loop(
     tick_start_time = time.time()
     maintenance_time = tick_start_time - start_time
     batch_idx = 0
+    resolution = training_set_kwargs.resolution
     if progress_fn is not None:
         progress_fn(0, total_kimg)
     while True:
@@ -256,7 +271,9 @@ def training_loop(
         # Fetch training data.
         with torch.autograd.profiler.record_function('data_fetch'):
             phase_real_img, phase_real_c = next(training_set_iterator)
-            phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
+            phase_real_img = phase_real_img.to(device).to(torch.float32)
+            # phase_real_img = torch.nn.functional.interpolate(phase_real_img, size=(resolution,) * 2, mode='bicubic', align_corners=True)
+            phase_real_img = (phase_real_img / 127.5 - 1).split(batch_gpu)
             phase_real_c = phase_real_c.to(device).split(batch_gpu)
             all_gen_z = torch.randn([len(phases) * batch_size, G.z_dim], device=device)
             all_gen_z = [phase_gen_z.split(batch_gpu) for phase_gen_z in all_gen_z.split(batch_size)]

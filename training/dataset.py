@@ -17,10 +17,39 @@ import torch
 import dnnlib
 from tqdm import tqdm
 
-try:
-    import pyspng
-except ImportError:
-    pyspng = None
+# try:
+#     import pyspng
+# except ImportError:
+#     pyspng = None
+pyspng = None
+
+from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+from joblib import Memory
+
+memory = Memory('/raid/cache', verbose=0, bytes_limit=4593148010496, compress=False)
+memory.reduce_size()
+
+def center_crop(image):
+    w, h = image.size
+    cropbox = (
+        w / 2 - h / 2 if w > h else 0,
+        h / 2 - w / 2 if h > w else 0,
+        w / 2 + h / 2 if w > h else w,
+        h / 2 + w / 2 if h > w else h,
+    )
+    return image.crop(cropbox)
+
+# @memory.cache
+def open_crop_resize_image(fname, w, h):
+    with open(fname, 'rb') as f:
+        # image = pyspng.load(f.read())
+        image = PIL.Image.open(f)
+        image = center_crop(image)
+        image = image.resize((w, h), resample=PIL.Image.LANCZOS)
+        image = np.array(image)
+        return image
 
 #----------------------------------------------------------------------------
 
@@ -32,12 +61,14 @@ class Dataset(torch.utils.data.Dataset):
         use_labels  = False,    # Enable conditioning labels? False = label dimension is zero.
         xflip       = False,    # Artificially double the size of the dataset via x-flips. Applied after max_size.
         random_seed = 0,        # Random seed to use when applying max_size.
+        resize = False,
     ):
         self._name = name
         self._raw_shape = list(raw_shape)
         self._use_labels = use_labels
         self._raw_labels = None
         self._label_shape = None
+        self._resize = resize
 
         # Apply max_size.
         self._raw_idx = np.arange(self._raw_shape[0], dtype=np.int64)
@@ -88,7 +119,8 @@ class Dataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         image = self._load_raw_image(self._raw_idx[idx])
         assert isinstance(image, np.ndarray)
-        assert list(image.shape) == self.image_shape
+
+        # assert list(image.shape) == self.image_shape
         assert image.dtype == np.uint8
         if self._xflip[idx]:
             assert image.ndim == 3 # CHW
@@ -116,6 +148,8 @@ class Dataset(torch.utils.data.Dataset):
 
     @property
     def image_shape(self):
+        if self.resize:
+            return [3, self._resolution, self._resolution]
         return list(self._raw_shape[1:])
 
     @property
@@ -161,6 +195,7 @@ class ImageFolderDataset(Dataset):
             **super_kwargs,         # Additional arguments for the Dataset base class.
         ):
         self._path = path
+        self._resolution = resolution
         self._zipfile = None
 
         if os.path.isdir(self._path):
@@ -180,13 +215,13 @@ class ImageFolderDataset(Dataset):
             raise IOError('Path must point to a directory or zip')
 
         PIL.Image.init()
-        self._image_fnames = sorted(fname for fname in self._all_fnames if self._file_ext(fname) in PIL.Image.EXTENSION)
+        self._image_fnames = list(self._all_fnames)
         if len(self._image_fnames) == 0:
             raise IOError('No image files found in the specified path')
 
+        self.resize = False
         raw_shape = [len(self._image_fnames)] + list(self._load_raw_image(0).shape)
-        if resolution is not None and (raw_shape[2] != resolution or raw_shape[3] != resolution):
-            raise IOError('Image files do not match the specified resolution')
+        self.resize = resolution is not None and (raw_shape[2] != resolution or raw_shape[3] != resolution)
         super().__init__(name=name, raw_shape=raw_shape, **super_kwargs)
 
     @staticmethod
@@ -220,14 +255,12 @@ class ImageFolderDataset(Dataset):
 
     def _load_raw_image(self, raw_idx):
         fname = self._image_fnames[raw_idx]
-        with self._open_file(fname) as f:
-            if pyspng is not None and self._file_ext(fname) == '.png':
-                image = pyspng.load(f.read())
-            else:
-                image = np.array(PIL.Image.open(f))
+        image = open_crop_resize_image(fname, self._resolution, self._resolution)
+        # image = image[..., 0][None]
         if image.ndim == 2:
-            image = image[:, :, np.newaxis] # HW => HWC
-        image = image.transpose(2, 0, 1) # HWC => CHW
+            image = np.repeat(image[np.newaxis], 3, axis=0)# HW => HWC
+        else:
+            image = image.transpose(2, 0, 1)[:3] # HWC => CHW
         return image
 
     def _load_raw_labels(self):

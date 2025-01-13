@@ -23,7 +23,7 @@ class Loss:
 #----------------------------------------------------------------------------
 
 class StyleGAN2Loss(Loss):
-    def __init__(self, device, G, D, augment_pipe=None, r1_gamma=10, style_mixing_prob=0, pl_weight=0, pl_batch_shrink=2, pl_decay=0.01, pl_no_weight_grad=False, blur_init_sigma=0, blur_fade_kimg=0):
+    def __init__(self, device, G, D, augment_pipe=None, r1_gamma=10, style_mixing_prob=0, pl_weight=0, pl_batch_shrink=2, pl_decay=0.01, pl_no_weight_grad=False, blur_init_sigma=0, blur_fade_kimg=0, noise_mode='const'):
         super().__init__()
         self.device             = device
         self.G                  = G
@@ -38,6 +38,7 @@ class StyleGAN2Loss(Loss):
         self.pl_mean            = torch.zeros([], device=device)
         self.blur_init_sigma    = blur_init_sigma
         self.blur_fade_kimg     = blur_fade_kimg
+        self.noise_mode = noise_mode
 
     def run_G(self, z, c, update_emas=False):
         ws = self.G.mapping(z, c, update_emas=update_emas)
@@ -46,7 +47,7 @@ class StyleGAN2Loss(Loss):
                 cutoff = torch.empty([], dtype=torch.int64, device=ws.device).random_(1, ws.shape[1])
                 cutoff = torch.where(torch.rand([], device=ws.device) < self.style_mixing_prob, cutoff, torch.full_like(cutoff, ws.shape[1]))
                 ws[:, cutoff:] = self.G.mapping(torch.randn_like(z), c, update_emas=False)[:, cutoff:]
-        img = self.G.synthesis(ws, update_emas=update_emas)
+        img = self.G.synthesis(ws, noise_mode=self.noise_mode, update_emas=update_emas)
         return img, ws
 
     def run_D(self, img, c, blur_sigma=0, update_emas=False):
