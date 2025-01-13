@@ -123,7 +123,7 @@ class InfiniteSampler(torch.utils.data.Sampler):
         self.window_size = window_size
 
     def __iter__(self):
-        order = np.arange(len(self.dataset))
+        order = np.arange(len(self.dataset), dtype=np.uint64)
         rnd = None
         window = 0
         if self.shuffle:
