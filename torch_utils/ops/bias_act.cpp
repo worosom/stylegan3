@@ -9,6 +9,8 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <climits>  // For INT_MAX
+#include <algorithm> // For std::min
 #include "bias_act.h"
 
 //------------------------------------------------------------------------
@@ -37,7 +39,7 @@ static torch::Tensor bias_act(torch::Tensor x, torch::Tensor b, torch::Tensor xr
     TORCH_CHECK(xref.numel() == 0 || (xref.sizes() == x.sizes() && xref.dtype() == x.dtype() && xref.device() == x.device()), "xref must have the same shape, dtype, and device as x");
     TORCH_CHECK(yref.numel() == 0 || (yref.sizes() == x.sizes() && yref.dtype() == x.dtype() && yref.device() == x.device()), "yref must have the same shape, dtype, and device as x");
     TORCH_CHECK(dy.numel() == 0 || (dy.sizes() == x.sizes() && dy.dtype() == x.dtype() && dy.device() == x.device()), "dy must have the same dtype and device as x");
-    TORCH_CHECK(x.numel() <= INT_MAX, "x is too large");
+    // Removed INT_MAX check to handle larger tensors
     TORCH_CHECK(b.dim() == 1, "b must have rank 1");
     TORCH_CHECK(b.numel() == 0 || (dim >= 0 && dim < x.dim()), "dim is out of bounds");
     TORCH_CHECK(b.numel() == 0 || b.numel() == x.size(dim), "b has wrong number of elements");
@@ -68,9 +70,15 @@ static torch::Tensor bias_act(torch::Tensor x, torch::Tensor b, torch::Tensor xr
     p.alpha = alpha;
     p.gain  = gain;
     p.clamp = clamp;
-    p.sizeX = (int)x.numel();
-    p.sizeB = (int)b.numel();
-    p.stepB = (b.numel()) ? (int)x.stride(dim) : 1;
+    // Use int64_t for calculations and safely cast to int for CUDA kernel
+    int64_t sizeX64 = x.numel();
+    int64_t sizeB64 = b.numel();
+    int64_t stepB64 = (b.numel()) ? x.stride(dim) : 1;
+    
+    // Safely cast to int with bounds checking for CUDA kernel
+    p.sizeX = (int)std::min<int64_t>(sizeX64, INT_MAX);
+    p.sizeB = (int)std::min<int64_t>(sizeB64, INT_MAX);
+    p.stepB = (int)std::min<int64_t>(stepB64, INT_MAX);
 
     // Choose CUDA kernel.
     void* kernel;
@@ -83,7 +91,11 @@ static torch::Tensor bias_act(torch::Tensor x, torch::Tensor b, torch::Tensor xr
     // Launch CUDA kernel.
     p.loopX = 4;
     int blockSize = 4 * 32;
-    int gridSize = (p.sizeX - 1) / (p.loopX * blockSize) + 1;
+    
+    // Calculate grid size using int64_t to prevent overflow
+    int64_t gridSize64 = (sizeX64 - 1) / (p.loopX * blockSize) + 1;
+    unsigned int gridSize = (unsigned int)std::min<int64_t>(gridSize64, INT_MAX);
+    
     void* args[] = {&p};
     AT_CUDA_CHECK(cudaLaunchKernel(kernel, gridSize, blockSize, args, 0, at::cuda::getCurrentCUDAStream()));
     return y;

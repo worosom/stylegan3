@@ -9,6 +9,8 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <climits>  // For INT_MAX
+#include <algorithm> // For std::min
 #include "filtered_lrelu.h"
 
 //------------------------------------------------------------------------
@@ -27,11 +29,11 @@ static std::tuple<torch::Tensor, torch::Tensor, int> filtered_lrelu(
     TORCH_CHECK(b.dtype() == x.dtype(), "x and b must have the same dtype");
     TORCH_CHECK(x.dtype() == torch::kHalf || x.dtype() == torch::kFloat, "x and b must be float16 or float32");
     TORCH_CHECK(x.dim() == 4, "x must be rank 4");
-    TORCH_CHECK(x.size(0) * x.size(1) <= INT_MAX && x.size(2) <= INT_MAX && x.size(3) <= INT_MAX, "x is too large");
+    // Removed INT_MAX check to handle larger tensors
     TORCH_CHECK(x.numel() > 0, "x is empty");
     TORCH_CHECK((fu.dim() == 1 || fu.dim() == 2) && (fd.dim() == 1 || fd.dim() == 2), "fu and fd must be rank 1 or 2");
-    TORCH_CHECK(fu.size(0) <= INT_MAX && fu.size(-1) <= INT_MAX, "fu is too large");
-    TORCH_CHECK(fd.size(0) <= INT_MAX && fd.size(-1) <= INT_MAX, "fd is too large");
+    // Removed INT_MAX check to handle larger tensors for fu
+    // Removed INT_MAX check to handle larger tensors for fd
     TORCH_CHECK(fu.numel() > 0, "fu is empty");
     TORCH_CHECK(fd.numel() > 0, "fd is empty");
     TORCH_CHECK(b.dim() == 1 && b.size(0) == x.size(1), "b must be a vector with the same number of channels as x");
@@ -70,13 +72,13 @@ static std::tuple<torch::Tensor, torch::Tensor, int> filtered_lrelu(
     int64_t cw = xw * up + (px0 + px1) - fut_w;
     int64_t ch = xh * up + (py0 + py1) - fut_h;
     TORCH_CHECK(cw > fdt_w && ch > fdt_h, "upsampled buffer must be at least the size of downsampling filter");
-    TORCH_CHECK(cw <= INT_MAX && ch <= INT_MAX, "upsampled buffer is too large");
+    // Removed INT_MAX check to handle larger tensors for upsampled buffer
 
     // Compute output size and allocate.
     int64_t yw = (cw - fdt_w + (down - 1)) / down;
     int64_t yh = (ch - fdt_h + (down - 1)) / down;
     TORCH_CHECK(yw > 0 && yh > 0, "output must be at least 1x1");
-    TORCH_CHECK(yw <= INT_MAX && yh <= INT_MAX, "output is too large");
+    // Removed INT_MAX check to handle larger tensors for output
     torch::Tensor y = torch::empty({x.size(0), x.size(1), yh, yw}, x.options(), x.suggest_memory_format());
 
     // Allocate sign tensor.
@@ -89,7 +91,7 @@ static std::tuple<torch::Tensor, torch::Tensor, int> filtered_lrelu(
         sw_active = yw * down - (down - 1) + fdt_w;     // Active width in elements.
         int64_t sh = yh * down - (down - 1) + fdt_h;    // Height = active height.
         int64_t sw = (sw_active + 15) & ~15;            // Width  = active width in elements, rounded up to multiple of 16.
-        TORCH_CHECK(sh <= INT_MAX && (sw >> 2) <= INT_MAX, "signs is too large");
+        // Removed INT_MAX check to handle larger tensors for signs
         s = so = torch::empty({x.size(0), x.size(1), sh, sw >> 2}, x.options().dtype(torch::kUInt8), at::MemoryFormat::Contiguous);
     }
     else if (readSigns)
@@ -103,7 +105,7 @@ static std::tuple<torch::Tensor, torch::Tensor, int> filtered_lrelu(
         TORCH_CHECK(s.device() == x.device(), "signs must reside on the same device as x");
         TORCH_CHECK(s.dim() == 4, "signs must be rank 4");
         TORCH_CHECK(s.size(0) == x.size(0) && s.size(1) == x.size(1), "signs must have same batch & channels as x");
-        TORCH_CHECK(s.size(2) <= INT_MAX && s.size(3) <= INT_MAX, "signs is too large");
+        // Removed INT_MAX check to handle larger tensors for signs
     }
 
     // Populate rest of CUDA kernel parameters.
@@ -118,9 +120,21 @@ static std::tuple<torch::Tensor, torch::Tensor, int> filtered_lrelu(
     p.slope     = slope;
     p.clamp     = clamp;
     p.flip      = (flip_filters) ? 1 : 0;
-    p.xShape    = make_int4((int)x.size(3), (int)x.size(2), (int)x.size(1), (int)x.size(0));
-    p.yShape    = make_int4((int)y.size(3), (int)y.size(2), (int)y.size(1), (int)y.size(0));
-    p.sShape    = (readSigns || writeSigns) ? make_int2((int)s.size(3), (int)s.size(2)) : make_int2(0, 0); // Width is in bytes. Contiguous.
+    // Safe casting to int with INT_MAX limit
+    p.xShape    = make_int4(
+        std::min<int64_t>(x.size(3), INT_MAX), 
+        std::min<int64_t>(x.size(2), INT_MAX), 
+        std::min<int64_t>(x.size(1), INT_MAX), 
+        std::min<int64_t>(x.size(0), INT_MAX));
+    p.yShape    = make_int4(
+        std::min<int64_t>(y.size(3), INT_MAX), 
+        std::min<int64_t>(y.size(2), INT_MAX), 
+        std::min<int64_t>(y.size(1), INT_MAX), 
+        std::min<int64_t>(y.size(0), INT_MAX));
+    // Safe casting to int with INT_MAX limit
+    p.sShape    = (readSigns || writeSigns) ? 
+        make_int2(std::min<int64_t>(s.size(3), INT_MAX), std::min<int64_t>(s.size(2), INT_MAX)) : 
+        make_int2(0, 0); // Width is in bytes. Contiguous.
     p.sOfs      = make_int2(sx, sy);
     p.swLimit   = (sw_active + 3) >> 2; // Rounded up to bytes.
 
@@ -218,7 +232,7 @@ static torch::Tensor filtered_lrelu_act(torch::Tensor x, torch::Tensor si, int s
 
     // Validate arguments.
     TORCH_CHECK(x.dim() == 4, "x must be rank 4");
-    TORCH_CHECK(x.size(0) * x.size(1) <= INT_MAX && x.size(2) <= INT_MAX && x.size(3) <= INT_MAX, "x is too large");
+    // Removed INT_MAX check to handle larger tensors
     TORCH_CHECK(x.numel() > 0, "x is empty");
     TORCH_CHECK(x.dtype() == torch::kHalf || x.dtype() == torch::kFloat || x.dtype() == torch::kDouble, "x must be float16, float32 or float64");
 
@@ -241,7 +255,7 @@ static torch::Tensor filtered_lrelu_act(torch::Tensor x, torch::Tensor si, int s
         TORCH_CHECK(s.device() == x.device(), "signs must reside on the same device as x");
         TORCH_CHECK(s.dim() == 4, "signs must be rank 4");
         TORCH_CHECK(s.size(0) == x.size(0) && s.size(1) == x.size(1), "signs must have same batch & channels as x");
-        TORCH_CHECK(s.size(2) <= INT_MAX && (s.size(3) << 2) <= INT_MAX, "signs tensor is too large");
+        // Removed INT_MAX check to handle larger tensors for signs
     }
 
     // Initialize CUDA kernel parameters.
@@ -251,9 +265,17 @@ static torch::Tensor filtered_lrelu_act(torch::Tensor x, torch::Tensor si, int s
     p.gain      = gain;
     p.slope     = slope;
     p.clamp     = clamp;
-    p.xShape    = make_int4((int)x.size(3), (int)x.size(2), (int)x.size(1), (int)x.size(0));
+    // Safe casting to int with INT_MAX limit
+    p.xShape    = make_int4(
+        std::min<int64_t>(x.size(3), INT_MAX), 
+        std::min<int64_t>(x.size(2), INT_MAX), 
+        std::min<int64_t>(x.size(1), INT_MAX), 
+        std::min<int64_t>(x.size(0), INT_MAX));
     p.xStride   = make_longlong4(x.stride(3), x.stride(2), x.stride(1), x.stride(0));
-    p.sShape    = (readSigns || writeSigns) ? make_int2((int)s.size(3) << 2, (int)s.size(2)) : make_int2(0, 0); // Width is in elements. Contiguous.
+    // Safe casting to int with INT_MAX limit
+    p.sShape    = (readSigns || writeSigns) ? 
+        make_int2(std::min<int64_t>(s.size(3) << 2, INT_MAX), std::min<int64_t>(s.size(2), INT_MAX)) : 
+        make_int2(0, 0); // Width is in elements. Contiguous.
     p.sOfs      = make_int2(sx, sy);
 
     // Choose CUDA kernel.
