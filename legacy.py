@@ -151,8 +151,8 @@ def convert_tf_generator(tf_G):
     kwarg('conditioning')
     kwarg('fused_modconv')
     unknown_kwargs = list(set(tf_kwargs.keys()) - known_kwargs)
-    if len(unknown_kwargs) > 0:
-        print('Unknown TensorFlow kwarg', unknown_kwargs[0])
+    # if len(unknown_kwargs) > 0:
+    #     print('Unknown TensorFlow kwarg', unknown_kwargs[0])
 
     # Collect params.
     tf_params = _collect_tf_params(tf_G)
